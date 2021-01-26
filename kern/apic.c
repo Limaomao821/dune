@@ -2,7 +2,7 @@
 
 #include <linux/mm.h>
 #include <linux/slab.h>
-#include <asm/ipi.h>
+#include <asm/apic.h>
 
 #include "dune.h"
 
@@ -90,6 +90,27 @@ static inline void dune_apic_write_x(u32 reg, u32 v)
 	asm volatile("movl %0, %P1" : "=r" (v), "=m" (*addr) : "i" (0), "0" (v), "m" (*addr));
 }
 
+static inline unsigned int __prepare_ICR(unsigned int shortcut, int vector,
+					 unsigned int dest)
+{
+	unsigned int icr = shortcut | dest;
+
+	switch (vector) {
+	default:
+		icr |= APIC_DM_FIXED | vector;
+		break;
+	case NMI_VECTOR:
+		icr |= APIC_DM_NMI;
+		break;
+	}
+	return icr;
+}
+
+static inline int __prepare_ICR2(unsigned int mask)
+{
+	return SET_APIC_DEST_FIELD(mask);
+}
+
 /* dune_apic_send_ipi_x2
  * Send an IPI to another local APIC. This function only supports x2APIC, not xAPIC.
  *
@@ -102,6 +123,41 @@ static void dune_apic_send_ipi_x2(u8 vector, u32 destination_apic_id)
 	low = __prepare_ICR(0, vector, APIC_DEST_PHYSICAL);
 	x2apic_wrmsr_fence();
 	wrmsrl(APIC_BASE_MSR + (APIC_ICR >> 4), ((__u64) destination_apic_id) << 32 | low);
+}
+
+static inline void __xapic_wait_icr_idle(void)
+{
+	while (native_apic_mem_read(APIC_ICR) & APIC_ICR_BUSY)
+		cpu_relax();
+}
+
+void __default_send_IPI_dest_field(unsigned int mask, int vector, unsigned int dest)
+{
+	unsigned long cfg;
+
+	/*
+	 * Wait for idle.
+	 */
+	if (unlikely(vector == NMI_VECTOR))
+		safe_apic_wait_icr_idle();
+	else
+		__xapic_wait_icr_idle();
+
+	/*
+	 * prepare target chip field
+	 */
+	cfg = __prepare_ICR2(mask);
+	native_apic_mem_write(APIC_ICR2, cfg);
+
+	/*
+	 * program the ICR
+	 */
+	cfg = __prepare_ICR(0, vector, dest);
+
+	/*
+	 * Send the IPI. The write to APIC_ICR fires this off.
+	 */
+	native_apic_mem_write(APIC_ICR, cfg);
 }
 
 /* dune_apic_send_ipi_x
